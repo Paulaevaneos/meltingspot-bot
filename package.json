@@ -2,8 +2,9 @@
   "name": "meltingspot-slack-bot",
   "version": "1.0.0",
   "description": "Slack bot para consultar actividad en MeltingSpot por agencia",
+  "main": "server.js",
   "scripts": {
-    "dev": "vercel dev"
+    "start": "node server.js"
   },
   "dependencies": {
     "axios": "^1.6.0"
