@@ -25,18 +25,25 @@ function parseCSV(csvText) {
   });
 }
 
-async function getActividadMeltingSpot(fechaInicio, fechaFin) {
+async function getActividadMeltingSpot(fromDate) {
   try {
-    const params = {};
-    if (fechaInicio) params.from = fechaInicio;
-    if (fechaFin) params.to = fechaFin;
+    // fromDate es obligatorio para la API de MeltingSpot
     const response = await axios.get(
       "https://openapi.meltingspot.io/v1/activities~export",
-      { headers: { Authorization: `Bearer ${MELTINGSPOT_API_KEY}` }, params, timeout: 15000 }
+      {
+        headers: { Authorization: `Bearer ${MELTINGSPOT_API_KEY}` },
+        params: { fromDate },
+        timeout: 20000,
+      }
     );
-    return response.data;
+    // La API puede devolver un array directamente o un objeto con data
+    const data = response.data;
+    if (Array.isArray(data)) return data;
+    if (data && Array.isArray(data.data)) return data.data;
+    if (data && Array.isArray(data.activities)) return data.activities;
+    return [];
   } catch (error) {
-    console.error("Error MeltingSpot:", error.response?.status, error.message);
+    console.error("Error MeltingSpot:", error.response?.status, JSON.stringify(error.response?.data), error.message);
     return null;
   }
 }
@@ -50,11 +57,15 @@ function calcularMetricas(actividades) {
   if (!actividades || actividades.length === 0) {
     return { ultimaConexion: "Sin actividad", modulos: 0, lives: 0, paginas: 0 };
   }
-  const fechas = actividades.map((a) => new Date(a.created_at || a.date || a.timestamp)).filter((d) => !isNaN(d));
-  const ultimaConexion = fechas.length > 0 ? new Date(Math.max(...fechas)).toLocaleDateString("es-ES") : "Desconocida";
-  const modulos = actividades.filter((a) => (a.type || a.activity_type || "").toLowerCase().includes("module")).length;
-  const lives = actividades.filter((a) => (a.type || a.activity_type || "").toLowerCase().includes("live")).length;
-  const paginas = actividades.filter((a) => (a.type || a.activity_type || "").toLowerCase().includes("page")).length;
+  const fechas = actividades
+    .map((a) => new Date(a.created_at || a.date || a.timestamp || a.createdAt))
+    .filter((d) => !isNaN(d));
+  const ultimaConexion = fechas.length > 0
+    ? new Date(Math.max(...fechas)).toLocaleDateString("es-ES")
+    : "Desconocida";
+  const modulos = actividades.filter((a) => (a.type || a.activity_type || a.eventType || "").toLowerCase().includes("module")).length;
+  const lives = actividades.filter((a) => (a.type || a.activity_type || a.eventType || "").toLowerCase().includes("live")).length;
+  const paginas = actividades.filter((a) => (a.type || a.activity_type || a.eventType || "").toLowerCase().includes("page")).length;
   return { ultimaConexion, modulos, lives, paginas };
 }
 
@@ -65,6 +76,11 @@ function construirRespuesta(nombreAgencia, agencyId, agentes, actividadTotal) {
 
   if (agentes.length === 0) {
     bloques.push({ type: "section", text: { type: "mrkdwn", text: `⚠️ No se encontraron agentes para el ID *${agencyId}*.\nRevisa el ID en la Google Sheet.` } });
+    return { blocks: bloques };
+  }
+
+  if (!actividadTotal) {
+    bloques.push({ type: "section", text: { type: "mrkdwn", text: `⚠️ No se pudieron obtener datos de MeltingSpot. Inténtalo de nuevo.` } });
     return { blocks: bloques };
   }
 
@@ -81,14 +97,8 @@ function construirRespuesta(nombreAgencia, agencyId, agentes, actividadTotal) {
     bloques.push({ type: "divider" });
   }
 
-  bloques.push({ type: "context", elements: [{ type: "mrkdwn", text: `Total agentes: *${agentes.length}* | ID: ${agencyId}` }] });
+  bloques.push({ type: "context", elements: [{ type: "mrkdwn", text: `Total agentes: *${agentes.length}* | ID agencia: ${agencyId}` }] });
   return { blocks: bloques };
-}
-
-function parsearFecha(texto) {
-  if (!texto) return null;
-  const fecha = new Date(texto);
-  return isNaN(fecha) ? null : fecha.toISOString().split("T")[0];
 }
 
 module.exports = async function handler(req, res) {
@@ -104,28 +114,34 @@ module.exports = async function handler(req, res) {
   const text = (body.text || "").trim();
   const parts = text.split(/\s+/);
   const agencyId = parts[0];
-  const fechaInicio = parsearFecha(parts[1]);
-  const fechaFin = parsearFecha(parts[2]);
   const responseUrl = body.response_url;
+
+  // Fecha de inicio: si se pasa como segundo parámetro úsala, si no por defecto 3 meses atrás
+  let fromDate = parts[1];
+  if (!fromDate) {
+    const hace3meses = new Date();
+    hace3meses.setMonth(hace3meses.getMonth() - 3);
+    fromDate = hace3meses.toISOString().split("T")[0];
+  }
 
   if (!agencyId) {
     return res.status(200).json({
       response_type: "ephemeral",
-      text: "⚠️ Uso: `/agencia ID_AGENCIA [fecha_inicio] [fecha_fin]`\nEjemplo: `/agencia AG001 2025-01-01 2025-03-31`",
+      text: "⚠️ Uso: `/agencia ID_AGENCIA [fecha_inicio]`\nEjemplo: `/agencia 69237 2025-01-01`\nSi no pones fecha, se usan los últimos 3 meses.",
     });
   }
 
-  // Responder a Slack inmediatamente (obligatorio en < 3 seg)
+  // Responder a Slack inmediatamente
   res.status(200).json({
     response_type: "in_channel",
-    text: `⏳ Buscando actividad de la agencia *${agencyId}*...`,
+    text: `⏳ Buscando actividad de la agencia *${agencyId}* desde ${fromDate}...`,
   });
 
-  // Procesar en segundo plano y enviar resultado via response_url
+  // Procesar y enviar resultado via response_url
   try {
     const [agentes, actividadTotal] = await Promise.all([
       getAgentesDeAgencia(agencyId),
-      getActividadMeltingSpot(fechaInicio, fechaFin),
+      getActividadMeltingSpot(fromDate),
     ]);
 
     const nombreAgencia = agentes.length > 0 ? agentes[0].nombre_agencia : agencyId;
@@ -133,7 +149,7 @@ module.exports = async function handler(req, res) {
 
     await axios.post(responseUrl, { response_type: "in_channel", replace_original: true, ...respuesta });
   } catch (error) {
-    console.error("Error:", error.message);
+    console.error("Error general:", error.message);
     try {
       await axios.post(responseUrl, {
         response_type: "in_channel",
