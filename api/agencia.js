@@ -27,18 +27,18 @@ function parseCSV(csvText) {
 
 async function getActividadMeltingSpot(fromTimestamp) {
   try {
-    const response = await axios.get(
-      "https://openapi.meltingspot.io/v1/activities~export",
-      {
-        headers: { Authorization: `Bearer ${MELTINGSPOT_API_KEY}` },
-        // fromDate debe ser un timestamp Unix (número entero en segundos)
-        params: { fromDate: fromTimestamp },
-        timeout: 20000,
-      }
-    );
+    // Formato correcto: fromDate[eq]=TIMESTAMP con -g para no codificar corchetes
+    // En axios usamos params con serializer personalizado
+    const url = `https://openapi.meltingspot.io/v1/activities~export?fromDate[eq]=${fromTimestamp}&limit=500`;
+    const response = await axios.get(url, {
+      headers: { Authorization: `Bearer ${MELTINGSPOT_API_KEY}` },
+      timeout: 20000,
+    });
     const data = response.data;
+    console.log("MeltingSpot OK, tipo:", typeof data, Array.isArray(data) ? "array:" + data.length : "keys:" + Object.keys(data).join(","));
     if (Array.isArray(data)) return data;
     if (data && Array.isArray(data.data)) return data.data;
+    if (data && Array.isArray(data.items)) return data.items;
     if (data && Array.isArray(data.activities)) return data.activities;
     return [];
   } catch (error) {
@@ -49,28 +49,36 @@ async function getActividadMeltingSpot(fromTimestamp) {
 
 function filtrarPorEmail(actividades, email) {
   if (!actividades || !Array.isArray(actividades)) return [];
-  return actividades.filter((a) => a.email && a.email.toLowerCase() === email.toLowerCase());
+  return actividades.filter((a) =>
+    (a.member_email || a.email || "").toLowerCase() === email.toLowerCase()
+  );
 }
 
 function calcularMetricas(actividades) {
   if (!actividades || actividades.length === 0) {
     return { ultimaConexion: "Sin actividad", modulos: 0, lives: 0, paginas: 0 };
   }
+
   const fechas = actividades
-    .map((a) => new Date(a.created_at || a.date || a.timestamp || a.createdAt))
+    .map((a) => new Date(a.occurred_at_tz || a.created_at || a.date || a.timestamp))
     .filter((d) => !isNaN(d));
   const ultimaConexion = fechas.length > 0
     ? new Date(Math.max(...fechas)).toLocaleDateString("es-ES")
     : "Desconocida";
+
+  // Tipos de actividad según la API de MeltingSpot
   const modulos = actividades.filter((a) =>
-    (a.type || a.activity_type || a.eventType || "").toLowerCase().includes("module")
+    ["CourseCompleted", "CourseStepCompleted", "LearningPathCompleted"].includes(a.type || a.eventType || "")
   ).length;
+
   const lives = actividades.filter((a) =>
-    (a.type || a.activity_type || a.eventType || "").toLowerCase().includes("live")
+    ["LiveAttended", "LiveReplayWatched"].includes(a.type || a.eventType || "")
   ).length;
+
   const paginas = actividades.filter((a) =>
-    (a.type || a.activity_type || a.eventType || "").toLowerCase().includes("page")
+    ["DocumentPageViewed"].includes(a.type || a.eventType || "")
   ).length;
+
   return { ultimaConexion, modulos, lives, paginas };
 }
 
@@ -108,14 +116,6 @@ function construirRespuesta(nombreAgencia, agencyId, agentes, actividadTotal) {
   return { blocks: bloques };
 }
 
-// Convierte YYYY-MM-DD o texto libre a timestamp Unix en segundos
-function parsearATimestamp(texto) {
-  if (!texto) return null;
-  const fecha = new Date(texto);
-  if (!isNaN(fecha)) return Math.floor(fecha.getTime() / 1000);
-  return null;
-}
-
 module.exports = async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Método no permitido" });
@@ -131,10 +131,11 @@ module.exports = async function handler(req, res) {
   const agencyId = parts[0];
   const responseUrl = body.response_url;
 
-  // Por defecto: últimos 3 meses en timestamp Unix
+  // Por defecto: 3 meses atrás en timestamp Unix (segundos)
   let fromTimestamp;
   if (parts[1]) {
-    fromTimestamp = parsearATimestamp(parts[1]);
+    const fecha = new Date(parts[1]);
+    if (!isNaN(fecha)) fromTimestamp = Math.floor(fecha.getTime() / 1000);
   }
   if (!fromTimestamp) {
     const hace3meses = new Date();
@@ -145,22 +146,23 @@ module.exports = async function handler(req, res) {
   if (!agencyId) {
     return res.status(200).json({
       response_type: "ephemeral",
-      text: "⚠️ Uso: `/agencia ID_AGENCIA [fecha_inicio]`\nEjemplo: `/agencia 69237 2025-01-01`\nSi no pones fecha, se usan los últimos 3 meses.",
+      text: "⚠️ Uso: `/agencia ID_AGENCIA [fecha_inicio]`\nEjemplo: `/agencia 69237 2025-01-01`",
     });
   }
 
-  // Responder a Slack inmediatamente (obligatorio en < 3 seg)
+  // Responder a Slack inmediatamente
   res.status(200).json({
     response_type: "in_channel",
     text: `⏳ Buscando actividad de la agencia *${agencyId}*...`,
   });
 
-  // Procesar y enviar resultado via response_url
   try {
     const [agentes, actividadTotal] = await Promise.all([
       getAgentesDeAgencia(agencyId),
       getActividadMeltingSpot(fromTimestamp),
     ]);
+
+    console.log(`Agentes encontrados: ${agentes.length}, Actividades: ${actividadTotal ? actividadTotal.length : 0}`);
 
     const nombreAgencia = agentes.length > 0 ? agentes[0].nombre_agencia : agencyId;
     const respuesta = construirRespuesta(nombreAgencia, agencyId, agentes, actividadTotal);
